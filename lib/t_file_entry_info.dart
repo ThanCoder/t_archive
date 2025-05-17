@@ -2,34 +2,24 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-class TArchiveResponseFile {
+class TFileEntryInfo {
   String name;
-  int size;
+  int length;
   int offset;
   String path;
-  TArchiveResponseFile({
+  TFileEntryInfo({
     required this.path,
     required this.name,
-    required this.size,
+    required this.length,
     required this.offset,
   });
 
-  static Future<Uint8List> readFileAtOffset(
-    RandomAccessFile raf,
-    int offset,
-    int size,
-  ) async {
-    final data = Uint8List(size);
-    await raf.setPosition(offset);
-
-    int total = 0;
-    while (total < size) {
-      final read = await raf.readInto(data, total, size);
-      if (read == 0) break;
-      total += read;
-    }
-
-    return data;
+  Future<Uint8List> readFileData() async {
+    final raf = File(path).openSync();
+    raf.setPositionSync(offset);
+    final bytes = raf.readSync(length);
+    raf.closeSync();
+    return bytes;
   }
 
   Future<void> writeFile(
@@ -37,13 +27,13 @@ class TArchiveResponseFile {
     void Function(double progress)? onProgress,
   }) async {
     const chunkSize = 1024 * 1024; // 1MB per chunk
-    final outFile = await File(outPath).openWrite();
+    final outFile = File(outPath).openWrite();
     final raf = await File(path).open();
 
     await raf.setPosition(offset);
 
     final buffer = Uint8List(chunkSize);
-    int remaining = size;
+    int remaining = length;
     int written = 0;
 
     while (remaining > 0) {
@@ -56,7 +46,7 @@ class TArchiveResponseFile {
 
       //progress
       if (onProgress != null) {
-        onProgress(written / size);
+        onProgress(written / length);
       }
     }
 
@@ -64,8 +54,12 @@ class TArchiveResponseFile {
     await raf.close();
   }
 
+  
+
   @override
   String toString() {
     return name;
   }
+
+  
 }

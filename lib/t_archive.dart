@@ -2,9 +2,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:t_archive/constants.dart';
+
 import 't_archive_file.dart';
-import 't_archive_response.dart';
-import 't_archive_response_file.dart';
+import 't_archive_header.dart';
+import 't_file_entry_info.dart';
 
 class TArchive {
   final Map<String, dynamic> config;
@@ -14,23 +16,23 @@ class TArchive {
   String mime;
   TArchive({
     required this.config,
-    this.mime = 'TZip',
-    this.version = 1,
+    this.mime = tArchiveMime,
+    this.version = tArchiveVersion,
     required this.files,
   });
 
   factory TArchive.createFiles(
     List<TArchiveFile> files, {
-    String mime = 'TZip',
-    required Map<String, dynamic> config,
+    String mime = tArchiveMime,
+    Map<String, dynamic> config = const {'creator': 'thanCoder'},
   }) {
     return TArchive(config: config, files: files, mime: mime);
   }
 
   factory TArchive.createDirectory(
     String path, {
-    required Map<String, dynamic> config,
-    String mime = 'TZip',
+    Map<String, dynamic> config = const {'creator': 'thanCoder'},
+    String mime = tArchiveMime,
   }) {
     final dir = Directory(path);
     if (!dir.existsSync()) throw Exception('dir not exists!');
@@ -48,11 +50,12 @@ class TArchive {
     Uint8List? coverImage,
     void Function(String name, double progress)? onProgress,
   }) async {
-    final sink = File(path).openWrite();
+    final file = File(path);
+    final sink = file.openWrite();
 
     // --- MAGIC + VERSION + FLAGS ---
     sink.add(utf8.encode(mime)); // magic
-    sink.add([version]); // version
+    sink.add([version]);
 
     int flags = 0;
     if (coverImage != null) flags |= 1 << 0;
@@ -71,29 +74,40 @@ class TArchive {
     sink.add(configSize.buffer.asUint8List());
     sink.add(configJson);
 
-    // --- File Meta JSON List ---
-    final jsonData = files.map((f) => f.toMap()).toList();
-    final fileListJson = utf8.encode(jsonEncode(jsonData));
-    final fileListSize = ByteData(4)..setUint32(0, fileListJson.length);
-    sink.add(fileListSize.buffer.asUint8List());
-    sink.add(fileListJson);
+    // --- File Index Section (names, offsets, lengths) ---
+    // final indexStart = await file.length(); // save index start position
+    // final fileCount = files.length;
 
-    // --- Total file data size for progress tracking ---
-    final totalSize = files.fold<int>(0, (sum, f) => sum + f.data.length);
-    int writtenSize = 0;
-
-    // --- Write each file ---
-    const chunkSize = 1024 * 1024; // 1MB
+    // placeholder for file index
+    final fileIndex = BytesBuilder();
+    int currentOffset = 0;
 
     for (final f in files) {
       final nameBytes = utf8.encode(f.name);
-      final nameLength = ByteData(2)..setUint16(0, nameBytes.length);
+      final nameLen = ByteData(2)..setUint16(0, nameBytes.length);
+      final offsetBytes = ByteData(8)..setInt64(0, currentOffset);
+      final lengthBytes = ByteData(8)..setInt64(0, f.data.length);
 
-      sink.add(nameLength.buffer.asUint8List());
-      sink.add(nameBytes);
+      fileIndex.add(nameLen.buffer.asUint8List());
+      fileIndex.add(nameBytes);
+      fileIndex.add(offsetBytes.buffer.asUint8List());
+      fileIndex.add(lengthBytes.buffer.asUint8List());
 
-      // --- Write file content in chunks ---
+      currentOffset += f.data.length;
+    }
+
+    final indexBytes = fileIndex.toBytes();
+    final indexSize = ByteData(4)..setUint32(0, indexBytes.length);
+    sink.add(indexSize.buffer.asUint8List());
+    sink.add(indexBytes);
+
+    // --- Write Actual File Data ---
+    int writtenSize = 0;
+    final totalSize = files.fold<int>(0, (sum, f) => sum + f.data.length);
+
+    for (final f in files) {
       final data = f.data;
+      const chunkSize = 1024 * 1024;
       int offset = 0;
 
       while (offset < data.length) {
@@ -105,8 +119,6 @@ class TArchive {
         if (onProgress != null) {
           onProgress(f.name, writtenSize / totalSize);
         }
-
-        // await Future.delayed(Duration.zero); // Let UI update
       }
     }
 
@@ -114,105 +126,180 @@ class TArchive {
     await sink.close();
   }
 
-  static Future<TArchiveResponse> readArchive(
+  static Future<TArchiveHeader> readHeader(
     String path, {
-    String mime = 'TZip',
+    String mime = tArchiveMime,
   }) async {
-    final file = File(path);
-    final raf = await file.open();
-    final reader = ByteData(8);
-    int offset = 0;
+    final raf = File(path).openSync();
 
-    // --- MAGIC (4 bytes), VERSION (1), FLAGS (1) ---
-    await raf.readInto(reader.buffer.asUint8List(0, 6));
-    final magic = utf8.decode(reader.buffer.asUint8List(0, 4));
-    if (magic != mime) throw Exception('Invalid format');
-    final version = reader.getUint8(4);
-    final flags = reader.getUint8(5);
-    offset += 6;
+    int pos = 0;
 
-    // --- Optional Cover Image ---
-    Uint8List? cover;
-    if ((flags & 0x01) != 0) {
-      await raf.setPosition(offset);
-      await raf.readInto(reader.buffer.asUint8List(0, 4));
-      final coverSize = reader.getUint32(0);
-      offset += 4;
+    // --- MAGIC ---
+    final magicBytes = raf.readSync(4); // adjust if your `mime` is longer
+    final magic = utf8.decode(magicBytes);
+    if (magic != mime) throw Exception('invalid MIME type');
+    pos += magicBytes.length;
 
-      cover = Uint8List(coverSize);
-      await raf.setPosition(offset);
-      await raf.readInto(cover);
-      offset += coverSize;
+    // --- VERSION ---
+    final version = raf.readByteSync();
+    pos++;
+
+    // --- FLAGS ---
+    final flags = raf.readByteSync();
+    pos++;
+
+    // --- Optional Cover ---
+    Uint8List? coverImage;
+    if ((flags & (1 << 0)) != 0) {
+      final coverSizeBytes = raf.readSync(4);
+      final coverSize = ByteData.sublistView(coverSizeBytes).getUint32(0);
+      coverImage = raf.readSync(coverSize);
+      pos += 4 + coverSize;
     }
 
     // --- Config JSON ---
-    await raf.setPosition(offset);
-    await raf.readInto(reader.buffer.asUint8List(0, 4));
-    final configSize = reader.getUint32(0);
-    offset += 4;
+    final configSizeBytes = raf.readSync(4);
+    final configSize = ByteData.sublistView(configSizeBytes).getUint32(0);
+    final configBytes = raf.readSync(configSize);
+    final config = jsonDecode(utf8.decode(configBytes));
+    pos += 4 + configSize;
 
-    final configBytes = Uint8List(configSize);
-    await raf.setPosition(offset);
-    await raf.readInto(configBytes);
-    final config = jsonDecode(utf8.decode(configBytes)) as Map<String, dynamic>;
-    offset += configSize;
+    // --- Index Section ---
+    final indexSizeBytes = raf.readSync(4);
+    final indexSize = ByteData.sublistView(indexSizeBytes).getUint32(0);
+    final indexBytes = raf.readSync(indexSize);
+    pos += 4 + indexSize;
 
-    // --- File List JSON ---
-    await raf.setPosition(offset);
-    await raf.readInto(reader.buffer.asUint8List(0, 4));
-    final fileListSize = reader.getUint32(0);
-    offset += 4;
+    final files = <TFileEntryInfo>[];
 
-    final fileListJsonBytes = Uint8List(fileListSize);
-    await raf.setPosition(offset);
-    await raf.readInto(fileListJsonBytes);
-    List<dynamic> fileMetaList = jsonDecode(utf8.decode(fileListJsonBytes));
-    offset += fileListSize;
+    int offset = 0;
+    int currentFileDataStart = pos; // total so far = where file data starts
 
-    // --- Read Each File Entry ---
-    List<TArchiveResponseFile> fileList = [];
-
-    for (final meta in fileMetaList) {
-      // Read name length
-      await raf.setPosition(offset);
-      await raf.readInto(reader.buffer.asUint8List(0, 2));
-      final nameLen = reader.getUint16(0);
+    while (offset < indexBytes.length) {
+      final nameLen = ByteData.sublistView(
+        indexBytes,
+        offset,
+        offset + 2,
+      ).getUint16(0);
       offset += 2;
 
-      // Read name bytes
-      final nameBytes = Uint8List(nameLen);
-      await raf.setPosition(offset);
-      await raf.readInto(nameBytes);
-      final name = utf8.decode(nameBytes);
+      final name = utf8.decode(indexBytes.sublist(offset, offset + nameLen));
       offset += nameLen;
 
-      // Get data size from meta
-      final dataSize = meta['size'] as int;
-      // final data = Uint8List(dataSize);
-      await raf.setPosition(offset);
-      // await raf.readInto(data);
+      final fileOffset = ByteData.sublistView(
+        indexBytes,
+        offset,
+        offset + 8,
+      ).getInt64(0);
+      offset += 8;
 
-      fileList.add(
-        TArchiveResponseFile(
+      final fileLength = ByteData.sublistView(
+        indexBytes,
+        offset,
+        offset + 8,
+      ).getInt64(0);
+      offset += 8;
+
+      files.add(
+        TFileEntryInfo(
           path: path,
           name: name,
-          size: dataSize,
-          offset: offset,
+          length: fileLength,
+          offset: currentFileDataStart + fileOffset,
         ),
       );
-
-      offset += dataSize;
     }
 
-    await raf.close();
+    raf.closeSync();
 
-    return TArchiveResponse(
-      config: config,
+    return TArchiveHeader(
       mime: magic,
       version: version,
-      coverImage: cover,
-      fileMetaList: fileMetaList,
-      fileList: fileList,
+      flags: flags,
+      coverImage: coverImage,
+      config: config,
+      files: files,
     );
+  }
+
+  static Future<void> deleteFile(
+    String archivePath, {
+    required String filename,
+  }) async {
+    final header = await readHeader(archivePath);
+    final oldFile = File(archivePath);
+    final tempFile = File('.$archivePath.tmp');
+    final sink = tempFile.openWrite();
+
+    // --- Write Header ---
+    sink.add(utf8.encode(header.mime));
+    sink.add([header.version]);
+    sink.add([header.flags]);
+
+    if (header.coverImage != null) {
+      final coverSize = ByteData(4)..setUint32(0, header.coverImage!.length);
+      sink.add(coverSize.buffer.asUint8List());
+      sink.add(header.coverImage!);
+    }
+
+    final configBytes = utf8.encode(jsonEncode(header.config));
+    final configSize = ByteData(4)..setUint32(0, configBytes.length);
+    sink.add(configSize.buffer.asUint8List());
+    sink.add(configBytes);
+
+    // --- Prepare Index + Data ---
+    final indexBuilder = BytesBuilder();
+    int currentOffset = 0;
+
+    final updatedFiles = <TFileEntryInfo>[];
+
+    for (final entry in header.files) {
+      if (entry.name == filename) {
+        continue; // skip this one = delete
+      }
+
+      final data = await entry.readFileData();
+
+      // Build index
+      final nameBytes = utf8.encode(entry.name);
+      final nameLen = ByteData(2)..setUint16(0, nameBytes.length);
+      final offsetBytes = ByteData(8)..setInt64(0, currentOffset);
+      final lengthBytes = ByteData(8)..setInt64(0, data.length);
+
+      indexBuilder.add(nameLen.buffer.asUint8List());
+      indexBuilder.add(nameBytes);
+      indexBuilder.add(offsetBytes.buffer.asUint8List());
+      indexBuilder.add(lengthBytes.buffer.asUint8List());
+
+      // updatedFiles.add(FileEntryInfo(entry.name, currentOffset, data.length));
+      updatedFiles.add(
+        TFileEntryInfo(
+          path: entry.path,
+          name: entry.name,
+          length: entry.length,
+          offset: entry.offset,
+        ),
+      );
+      currentOffset += data.length;
+    }
+
+    // Write index section
+    final indexBytes = indexBuilder.toBytes();
+    final indexSize = ByteData(4)..setUint32(0, indexBytes.length);
+    sink.add(indexSize.buffer.asUint8List());
+    sink.add(indexBytes);
+
+    // Write file data
+    for (final file in updatedFiles) {
+      // final data = await readFileData(archivePath, file.offset, file.length);
+      final data = await file.readFileData();
+      sink.add(data);
+    }
+
+    await sink.flush();
+    await sink.close();
+
+    await oldFile.delete();
+    await tempFile.rename(archivePath);
   }
 }

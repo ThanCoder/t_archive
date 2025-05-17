@@ -1,6 +1,6 @@
 name: t_archive
 description: "thancoder custom binary format file."
-version: 0.0.1
+version: 0.1.0
 homepage: https://github.com/ThanCoder/t_archive.git
 repository: https://github.com/ThanCoder/t_archive.git
 
