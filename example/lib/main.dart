@@ -1,36 +1,37 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:t_archive/t_archive.dart';
 import 'package:t_archive/t_archive_file.dart';
 
 void main() async {
-  final tArchive = TArchive.createFiles(
-    [TArchiveFile.fromFile('')],
-    config: {},
-    mime: 'custom mime type',
-  );
+  final tArchive = TArchive.createFiles([
+    TArchiveFile.fromFile('/home/thancoder/Videos/【GMV】- BOSS B_TCH.mp4'),
+  ]);
   // TArchive.createFiles([TArchiveFile('name', Uint8List(0))], config: {});
 
-  //save
+  // save
   tArchive.writeToFile(
     'savepath.bin',
-    coverImage: File('cover.png').readAsBytesSync(),
-    onProgress: (name, progress) {},
+    // coverImage: File('cover.png').readAsBytesSync(),
+    onProgress: (name, progress) {
+      print('$name - ${(progress * 100).toStringAsFixed(1)}%');
+    },
   );
 
   //read
-  final archive = await TArchive.readArchive(
-    'savepath.bin',
-    mime: 'check custom mime',
-  );
+  final archive = await TArchive.readHeader('savepath.bin');
   print(archive.config);
-  print(archive.fileMetaList);
-  print(archive.fileList);
-  if (archive.coverImage != null) {
-    //you can save
-    File('out-cover.png').writeAsBytesSync(archive.coverImage!);
-  }
+  print(archive.mime);
+  print(archive.version);
+  print(archive.coverImage);
+  print(archive.files);
+  await TArchive.deleteFile('savepath.bin', filename: archive.files.first.name);
+  print('deleted');
+  archive.files.first.writeFile(
+    'out.mp4',
+    onProgress: (progress) {
+      print('${(progress * 100).toStringAsFixed(1)}%');
+    },
+  );
 
   runApp(const MyApp());
 }
